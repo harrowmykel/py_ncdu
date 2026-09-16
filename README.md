@@ -6,6 +6,8 @@ A lightweight, standalone, cross-platform Python implementation of **`ncdu`** (N
 
 ## Features
 
+- **Multi-threaded Scanning (Default)**: Leverages a worker thread pool for high-throughput scanning on fast SSDs / NVMes, with customizable thread count (`-j / --threads`).
+- **Fast Speed & Time Estimation**: Calibrates scanning rate based on the first 100 files to minimize computational overhead during large scans.
 - **Interactive TUI Navigation**: Move effortlessly through directory trees with arrow keys or Vim keybindings (`h`/`j`/`k`/`l`).
 - **Visual Relative Size Bars**: Instant visual indicator `[#####     ]` showing space consumption relative to the largest item in the current folder.
 - **Fast & Resilient Scanning**: Recursively scans directories with real-time progress indicators, handling permission errors and broken symlinks gracefully.
@@ -42,11 +44,14 @@ pip install -r requirements.txt
 
 ### Basic Scan & Browse
 ```bash
-# Scan and browse current directory
+# Scan and browse current directory (multi-threaded by default)
 python ncdu.py
 
-# Scan a specific directory
-python ncdu.py /path/to/folder
+# Scan a specific directory with 16 worker threads
+python ncdu.py -j 16 /path/to/folder
+
+# Single-threaded mode (for legacy HDDs)
+python ncdu.py -j 1 /path/to/folder
 ```
 
 ### Advanced Options

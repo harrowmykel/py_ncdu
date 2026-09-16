@@ -141,6 +141,32 @@ class TestNcdu(unittest.TestCase):
 
         self.assertEqual(root.size, 900)
 
+    def test_multithreaded_vs_sequential(self):
+        scanner_seq = Scanner(self.test_dir, threads=1)
+        root_seq = scanner_seq.scan()
+
+        scanner_mt = Scanner(self.test_dir, threads=4)
+        root_mt = scanner_mt.scan()
+
+        self.assertEqual(root_seq.size, root_mt.size)
+        self.assertEqual(root_seq.item_count, root_mt.item_count)
+        self.assertEqual(len(root_seq.children), len(root_mt.children))
+
+    def test_100_files_calibration(self):
+        # Create a directory with 150 files to verify calibration trigger
+        bulk_dir = os.path.join(self.test_dir, "bulk")
+        os.makedirs(bulk_dir)
+        for i in range(120):
+            with open(os.path.join(bulk_dir, f"file_{i}.txt"), "wb") as f:
+                f.write(b"X" * 10)
+
+        scanner = Scanner(bulk_dir, threads=2)
+        root = scanner.scan()
+
+        self.assertIsNotNone(scanner.calibrated_rate)
+        self.assertGreater(scanner.calibrated_rate, 0)
+        self.assertEqual(root.item_count, 120)
+
 
 if __name__ == "__main__":
     unittest.main()

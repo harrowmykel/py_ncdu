@@ -137,22 +137,35 @@ class Node:
         return node
 
 
+import threading
+from queue import Queue, Empty
+
+
 class Scanner:
-    """Recursively scans directory trees."""
+    """Multi-threaded recursive filesystem scanner with speed calibration."""
 
     def __init__(
         self,
         root_path: str,
         same_fs: bool = False,
         excludes: Optional[List[str]] = None,
+        threads: Optional[int] = None,
         progress_callback=None,
     ):
         self.root_path = os.path.abspath(root_path)
         self.same_fs = same_fs
         self.excludes = excludes or []
+        if threads is None or threads <= 0:
+            self.threads = min(32, (os.cpu_count() or 1) * 4)
+        else:
+            self.threads = threads
         self.progress_callback = progress_callback
         self.scanned_items = 0
         self.root_dev: Optional[int] = None
+        self._lock = threading.Lock()
+        self.start_time = 0.0
+        self.calibrated_rate: Optional[float] = None  # items per second based on first 100 files
+        self.calibrated_time_for_100: Optional[float] = None
 
     def _is_excluded(self, path: str, name: str) -> bool:
         for pat in self.excludes:
@@ -161,7 +174,7 @@ class Scanner:
         return False
 
     def scan(self) -> Node:
-        """Perform recursive directory scan."""
+        """Perform multi-threaded directory scan."""
         try:
             stat_root = os.stat(self.root_path, follow_symlinks=False)
             self.root_dev = stat_root.st_dev
@@ -177,26 +190,31 @@ class Scanner:
             mtime=mtime,
         )
 
-        if root_node.is_dir:
-            self._scan_dir(root_node)
-            root_node.recalculate()
-        else:
+        if not root_node.is_dir:
             try:
                 root_node.size = os.path.getsize(self.root_path)
             except OSError:
                 root_node.size = 0
             root_node.item_count = 1
+            return root_node
 
+        self.start_time = time.time()
+        self.scanned_items = 0
+
+        if self.threads <= 1:
+            self._scan_dir_sequential(root_node)
+        else:
+            self._scan_dir_multithreaded(root_node)
+
+        root_node.recalculate()
         return root_node
 
-    def _scan_dir(self, dir_node: Node) -> None:
-        if self.progress_callback and self.scanned_items % 50 == 0:
-            self.progress_callback(dir_node.path, self.scanned_items)
-
+    def _scan_dir_sequential(self, dir_node: Node) -> None:
+        self._record_progress(dir_node.path)
         try:
             with os.scandir(dir_node.path) as it:
                 for entry in it:
-                    self.scanned_items += 1
+                    self._increment_item()
                     name = entry.name
                     path = entry.path
 
@@ -206,21 +224,13 @@ class Scanner:
                     try:
                         stat = entry.stat(follow_symlinks=False)
                     except OSError:
-                        # Broken symlink or inaccessible entry
-                        child = Node(
-                            name=name,
-                            path=path,
-                            is_dir=False,
-                            size=0,
-                            parent=dir_node,
-                        )
+                        child = Node(name=name, path=path, is_dir=False, size=0, parent=dir_node)
                         child.read_error = True
                         dir_node.add_child(child)
                         continue
 
-                    if self.same_fs and self.root_dev is not None:
-                        if stat.st_dev != self.root_dev:
-                            continue
+                    if self.same_fs and self.root_dev is not None and stat.st_dev != self.root_dev:
+                        continue
 
                     is_dir = entry.is_dir(follow_symlinks=False)
                     child = Node(
@@ -234,10 +244,103 @@ class Scanner:
                     dir_node.add_child(child)
 
                     if is_dir:
-                        self._scan_dir(child)
-
+                        self._scan_dir_sequential(child)
         except (PermissionError, OSError):
             dir_node.read_error = True
+
+    def _scan_dir_multithreaded(self, root_node: Node) -> None:
+        work_queue: Queue = Queue()
+        work_queue.put(root_node)
+        active_lock = threading.Lock()
+        active_count = 0
+        all_done = threading.Event()
+
+        def worker():
+            nonlocal active_count
+            while not all_done.is_set():
+                try:
+                    dir_node = work_queue.get(timeout=0.05)
+                except Empty:
+                    with active_lock:
+                        if active_count == 0 and work_queue.empty():
+                            all_done.set()
+                            return
+                    continue
+
+                with active_lock:
+                    active_count += 1
+
+                try:
+                    self._record_progress(dir_node.path)
+                    with os.scandir(dir_node.path) as it:
+                        for entry in it:
+                            self._increment_item()
+                            name = entry.name
+                            path = entry.path
+
+                            if self._is_excluded(path, name):
+                                continue
+
+                            try:
+                                stat = entry.stat(follow_symlinks=False)
+                            except OSError:
+                                child = Node(name=name, path=path, is_dir=False, size=0, parent=dir_node)
+                                child.read_error = True
+                                with self._lock:
+                                    dir_node.add_child(child)
+                                continue
+
+                            if self.same_fs and self.root_dev is not None and stat.st_dev != self.root_dev:
+                                continue
+
+                            is_dir = entry.is_dir(follow_symlinks=False)
+                            child = Node(
+                                name=name,
+                                path=path,
+                                is_dir=is_dir,
+                                size=stat.st_size if not is_dir else 0,
+                                mtime=stat.st_mtime,
+                                parent=dir_node,
+                            )
+                            with self._lock:
+                                dir_node.add_child(child)
+
+                            if is_dir:
+                                work_queue.put(child)
+                except (PermissionError, OSError):
+                    dir_node.read_error = True
+                finally:
+                    with active_lock:
+                        active_count -= 1
+                        if active_count == 0 and work_queue.empty():
+                            all_done.set()
+                    work_queue.task_done()
+
+        worker_threads = []
+        for _ in range(self.threads):
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
+            worker_threads.append(t)
+
+        for t in worker_threads:
+            t.join()
+
+    def _increment_item(self) -> None:
+        with self._lock:
+            self.scanned_items += 1
+            # Calibration: calculate rate on the first 100 items
+            if self.scanned_items == 100 and self.calibrated_rate is None:
+                elapsed = time.time() - self.start_time
+                self.calibrated_time_for_100 = elapsed
+                self.calibrated_rate = 100.0 / max(elapsed, 0.0001)
+
+    def _record_progress(self, path: str) -> None:
+        if self.progress_callback and (self.scanned_items % 50 == 0 or self.scanned_items < 100):
+            with self._lock:
+                count = self.scanned_items
+                rate = self.calibrated_rate
+                elapsed = time.time() - self.start_time
+            self.progress_callback(path, count, rate, elapsed)
 
 
 class NcduApp:
@@ -602,10 +705,15 @@ class NcduApp:
             curses.curs_set(0)
 
 
-def scan_progress_terminal(path: str, count: int) -> None:
-    """Print scan progress to terminal before curses starts."""
-    path_trunc = path if len(path) < 60 else "..." + path[-57:]
-    sys.stdout.write(f"\rScanning items: {count:>7}  |  {path_trunc:<60}")
+def scan_progress_terminal(path: str, count: int, rate: Optional[float], elapsed: float) -> None:
+    """Print scan progress and speed estimation to terminal before curses starts."""
+    path_trunc = path if len(path) < 40 else "..." + path[-37:]
+    if rate is not None:
+        rate_str = f"{int(rate):>5} items/s"
+    else:
+        rate_str = "calibrating..."
+
+    sys.stdout.write(f"\rScanning items: {count:>7}  |  Speed (1st 100): {rate_str:<15} |  Elapsed: {elapsed:>4.1f}s  |  {path_trunc:<40}")
     sys.stdout.flush()
 
 
@@ -619,6 +727,13 @@ def main() -> None:
         nargs="?",
         default=".",
         help="Directory path to scan (default: current directory)",
+    )
+    parser.add_argument(
+        "-j",
+        "--threads",
+        type=int,
+        default=min(32, (os.cpu_count() or 1) * 4),
+        help=f"Number of scanning worker threads (default: {min(32, (os.cpu_count() or 1) * 4)})",
     )
     parser.add_argument(
         "-x",
@@ -673,19 +788,22 @@ def main() -> None:
             print(f"Error: Path does not exist: {target_path}", file=sys.stderr)
             sys.exit(1)
 
-        print(f"Scanning directory: {target_path} ...")
+        print(f"Scanning directory: {target_path} (threads: {args.threads}) ...")
         scanner = Scanner(
             root_path=target_path,
             same_fs=args.same_fs,
             excludes=args.exclude,
+            threads=args.threads,
             progress_callback=scan_progress_terminal,
         )
         t0 = time.time()
         root_node = scanner.scan()
         scan_time = time.time() - t0
-        sys.stdout.write("\r" + " " * 90 + "\r")
+        sys.stdout.write("\r" + " " * 110 + "\r")
         sys.stdout.flush()
-        print(f"Scan complete: {scanner.scanned_items} items in {scan_time:.2f}s ({format_size(root_node.size).strip()})")
+
+        rate_info = f", estimated speed: {int(scanner.calibrated_rate)} items/s (calibrated on first 100 files)" if scanner.calibrated_rate else ""
+        print(f"Scan complete: {scanner.scanned_items} items in {scan_time:.2f}s ({format_size(root_node.size).strip()}{rate_info})")
 
         # If export requested
         if args.export:
