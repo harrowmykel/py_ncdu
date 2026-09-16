@@ -7,6 +7,8 @@ A lightweight, standalone, cross-platform Python implementation of **`ncdu`** (N
 ## Features
 
 - **Multi-threaded Scanning (Default)**: Leverages a worker thread pool for high-throughput scanning on fast SSDs / NVMes, with customizable thread count (`-j / --threads`).
+- **Clean Single-Line Progress (Every 2s)**: Displays a single rate-limited progress update every 2 seconds on the main thread, avoiding terminal flicker and console I/O lock contention.
+- **Instant `Ctrl + C` Stop**: Thread-safe cancellation using `threading.Event` allows immediate and clean aborts without hanging background threads.
 - **Fast Speed & Time Estimation**: Calibrates scanning rate based on the first 100 files to minimize computational overhead during large scans.
 - **Interactive TUI Navigation**: Move effortlessly through directory trees with arrow keys or Vim keybindings (`h`/`j`/`k`/`l`).
 - **Visual Relative Size Bars**: Instant visual indicator `[#####     ]` showing space consumption relative to the largest item in the current folder.

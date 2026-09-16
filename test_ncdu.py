@@ -153,7 +153,7 @@ class TestNcdu(unittest.TestCase):
         self.assertEqual(len(root_seq.children), len(root_mt.children))
 
     def test_100_files_calibration(self):
-        # Create a directory with 150 files to verify calibration trigger
+        # Create a directory with 120 files to verify calibration trigger
         bulk_dir = os.path.join(self.test_dir, "bulk")
         os.makedirs(bulk_dir)
         for i in range(120):
@@ -166,6 +166,23 @@ class TestNcdu(unittest.TestCase):
         self.assertIsNotNone(scanner.calibrated_rate)
         self.assertGreater(scanner.calibrated_rate, 0)
         self.assertEqual(root.item_count, 120)
+
+    def test_cancellation_with_stop_event(self):
+        # Create a large tree
+        nested_dir = os.path.join(self.test_dir, "nested_cancel")
+        os.makedirs(nested_dir)
+        for i in range(50):
+            sub = os.path.join(nested_dir, f"sub_{i}")
+            os.makedirs(sub)
+            with open(os.path.join(sub, "data.bin"), "wb") as f:
+                f.write(b"0" * 100)
+
+        scanner = Scanner(nested_dir, threads=4)
+        # Pre-set stop event or trigger stop immediately
+        scanner.stop()
+        result = scanner.scan()
+        self.assertIsNone(result)
+        self.assertTrue(scanner.stop_event.is_set())
 
 
 if __name__ == "__main__":

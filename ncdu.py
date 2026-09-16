@@ -142,7 +142,7 @@ from queue import Queue, Empty
 
 
 class Scanner:
-    """Multi-threaded recursive filesystem scanner with speed calibration."""
+    """Multi-threaded recursive filesystem scanner with speed calibration and Ctrl+C support."""
 
     def __init__(
         self,
@@ -166,6 +166,9 @@ class Scanner:
         self.start_time = 0.0
         self.calibrated_rate: Optional[float] = None  # items per second based on first 100 files
         self.calibrated_time_for_100: Optional[float] = None
+        self.stop_event = threading.Event()
+        self.latest_path = ""
+        self._last_seq_progress_time = 0.0
 
     def _is_excluded(self, path: str, name: str) -> bool:
         for pat in self.excludes:
@@ -173,8 +176,12 @@ class Scanner:
                 return True
         return False
 
-    def scan(self) -> Node:
-        """Perform multi-threaded directory scan."""
+    def stop(self) -> None:
+        """Signal all worker threads to cancel scanning."""
+        self.stop_event.set()
+
+    def scan(self) -> Optional[Node]:
+        """Perform directory scan with cancellation support."""
         try:
             stat_root = os.stat(self.root_path, follow_symlinks=False)
             self.root_dev = stat_root.st_dev
@@ -200,20 +207,44 @@ class Scanner:
 
         self.start_time = time.time()
         self.scanned_items = 0
+        self._last_seq_progress_time = self.start_time
 
-        if self.threads <= 1:
-            self._scan_dir_sequential(root_node)
-        else:
-            self._scan_dir_multithreaded(root_node)
+        try:
+            if self.threads <= 1:
+                self._scan_dir_sequential(root_node)
+            else:
+                self._scan_dir_multithreaded(root_node)
+        except KeyboardInterrupt:
+            self.stop()
+            raise
+
+        if self.stop_event.is_set():
+            return None
 
         root_node.recalculate()
         return root_node
 
     def _scan_dir_sequential(self, dir_node: Node) -> None:
-        self._record_progress(dir_node.path)
+        if self.stop_event.is_set():
+            return
+
+        self._record_path(dir_node.path)
+        now = time.time()
+        if self.progress_callback and (now - self._last_seq_progress_time >= 2.0):
+            self._last_seq_progress_time = now
+            self.progress_callback(
+                self.latest_path,
+                self.scanned_items,
+                self.calibrated_rate,
+                now - self.start_time,
+            )
+
         try:
             with os.scandir(dir_node.path) as it:
                 for entry in it:
+                    if self.stop_event.is_set():
+                        return
+
                     self._increment_item()
                     name = entry.name
                     path = entry.path
@@ -257,7 +288,7 @@ class Scanner:
 
         def worker():
             nonlocal active_count
-            while not all_done.is_set():
+            while not all_done.is_set() and not self.stop_event.is_set():
                 try:
                     dir_node = work_queue.get(timeout=0.05)
                 except Empty:
@@ -267,13 +298,20 @@ class Scanner:
                             return
                     continue
 
+                if self.stop_event.is_set():
+                    work_queue.task_done()
+                    return
+
                 with active_lock:
                     active_count += 1
 
                 try:
-                    self._record_progress(dir_node.path)
+                    self._record_path(dir_node.path)
                     with os.scandir(dir_node.path) as it:
                         for entry in it:
+                            if self.stop_event.is_set():
+                                break
+
                             self._increment_item()
                             name = entry.name
                             path = entry.path
@@ -305,7 +343,7 @@ class Scanner:
                             with self._lock:
                                 dir_node.add_child(child)
 
-                            if is_dir:
+                            if is_dir and not self.stop_event.is_set():
                                 work_queue.put(child)
                 except (PermissionError, OSError):
                     dir_node.read_error = True
@@ -322,8 +360,32 @@ class Scanner:
             t.start()
             worker_threads.append(t)
 
+        # Main thread coordinates and prints progress every 2 seconds
+        try:
+            while not all_done.wait(timeout=2.0):
+                if self.stop_event.is_set():
+                    break
+                if self.progress_callback:
+                    with self._lock:
+                        count = self.scanned_items
+                        rate = self.calibrated_rate
+                        path = self.latest_path
+                        elapsed = time.time() - self.start_time
+                    self.progress_callback(path, count, rate, elapsed)
+        except KeyboardInterrupt:
+            self.stop()
+            all_done.set()
+            # Drain queue so blocked threads unblock
+            while not work_queue.empty():
+                try:
+                    work_queue.get_nowait()
+                    work_queue.task_done()
+                except Empty:
+                    break
+            raise
+
         for t in worker_threads:
-            t.join()
+            t.join(timeout=0.5)
 
     def _increment_item(self) -> None:
         with self._lock:
@@ -334,13 +396,9 @@ class Scanner:
                 self.calibrated_time_for_100 = elapsed
                 self.calibrated_rate = 100.0 / max(elapsed, 0.0001)
 
-    def _record_progress(self, path: str) -> None:
-        if self.progress_callback and (self.scanned_items % 50 == 0 or self.scanned_items < 100):
-            with self._lock:
-                count = self.scanned_items
-                rate = self.calibrated_rate
-                elapsed = time.time() - self.start_time
-            self.progress_callback(path, count, rate, elapsed)
+    def _record_path(self, path: str) -> None:
+        with self._lock:
+            self.latest_path = path
 
 
 class NcduApp:
@@ -706,14 +764,15 @@ class NcduApp:
 
 
 def scan_progress_terminal(path: str, count: int, rate: Optional[float], elapsed: float) -> None:
-    """Print scan progress and speed estimation to terminal before curses starts."""
+    """Print a single progress line every 2 seconds before curses starts."""
     path_trunc = path if len(path) < 40 else "..." + path[-37:]
     if rate is not None:
-        rate_str = f"{int(rate):>5} items/s"
+        rate_str = f"~{int(rate):>5} items/s"
     else:
         rate_str = "calibrating..."
 
-    sys.stdout.write(f"\rScanning items: {count:>7}  |  Speed (1st 100): {rate_str:<15} |  Elapsed: {elapsed:>4.1f}s  |  {path_trunc:<40}")
+    line = f"\rScanning items: {count:>7}  |  Speed (1st 100): {rate_str:<15} |  Elapsed: {elapsed:>4.1f}s  |  {path_trunc:<40}"
+    sys.stdout.write(line)
     sys.stdout.flush()
 
 
@@ -797,7 +856,17 @@ def main() -> None:
             progress_callback=scan_progress_terminal,
         )
         t0 = time.time()
-        root_node = scanner.scan()
+        try:
+            root_node = scanner.scan()
+        except KeyboardInterrupt:
+            sys.stdout.write("\r" + " " * 110 + "\r")
+            print("[Scan cancelled by user (Ctrl+C)]")
+            sys.exit(130)
+
+        if root_node is None:
+            print("[Scan aborted]")
+            sys.exit(130)
+
         scan_time = time.time() - t0
         sys.stdout.write("\r" + " " * 110 + "\r")
         sys.stdout.flush()
@@ -818,7 +887,10 @@ def main() -> None:
 
     # Start TUI
     app = NcduApp(root_node)
-    app.run()
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
