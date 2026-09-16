@@ -184,6 +184,18 @@ class TestNcdu(unittest.TestCase):
         self.assertIsNone(result)
         self.assertTrue(scanner.stop_event.is_set())
 
+    def test_thread_status_tracking(self):
+        scanner = Scanner(self.test_dir, threads=3)
+        scanner.scan()
+        items, rate, elapsed, thread_status = scanner.get_thread_status()
+        self.assertGreater(items, 0)
+        self.assertEqual(len(thread_status), 3)
+        for tid in range(3):
+            self.assertIn(tid, thread_status)
+            self.assertIn("status", thread_status[tid])
+            self.assertIn("items", thread_status[tid])
+            self.assertIn("path", thread_status[tid])
+
 
 if __name__ == "__main__":
     unittest.main()

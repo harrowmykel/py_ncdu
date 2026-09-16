@@ -6,9 +6,10 @@ A lightweight, standalone, cross-platform Python implementation of **`ncdu`** (N
 
 ## Features
 
+- **Live Curses Multi-Thread Dashboard**: Interactive scan phase in curses showing real-time overall stats (scanned items, speed, elapsed time) and a dedicated live status line for each worker thread (`Thread #00: [SCANNING] 412 items | /path/to/folder`).
+- **Seamless TUI Transition**: Automatically transitions from the live scan dashboard directly into the interactive directory browser with zero flicker.
 - **Multi-threaded Scanning (Default)**: Leverages a worker thread pool for high-throughput scanning on fast SSDs / NVMes, with customizable thread count (`-j / --threads`).
-- **Clean Single-Line Progress (Every 2s)**: Displays a single rate-limited progress update every 2 seconds on the main thread, avoiding terminal flicker and console I/O lock contention.
-- **Instant `Ctrl + C` Stop**: Thread-safe cancellation using `threading.Event` allows immediate and clean aborts without hanging background threads.
+- **Instant `Ctrl + C` / `q` Stop**: Thread-safe cancellation using `threading.Event` allows immediate and clean aborts without hanging background threads.
 - **Fast Speed & Time Estimation**: Calibrates scanning rate based on the first 100 files to minimize computational overhead during large scans.
 - **Interactive TUI Navigation**: Move effortlessly through directory trees with arrow keys or Vim keybindings (`h`/`j`/`k`/`l`).
 - **Visual Relative Size Bars**: Instant visual indicator `[#####     ]` showing space consumption relative to the largest item in the current folder.
@@ -21,6 +22,7 @@ A lightweight, standalone, cross-platform Python implementation of **`ncdu`** (N
 - **Filesystem Boundaries & Filtering**:
   - Stay on the same filesystem/mount point (`-x` / `--same-fs`).
   - Exclude patterns (`--exclude <pattern>`).
+  - Headless/text-only scanning flag (`--no-curses`).
 
 ---
 

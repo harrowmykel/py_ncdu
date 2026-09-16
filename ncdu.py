@@ -169,6 +169,9 @@ class Scanner:
         self.stop_event = threading.Event()
         self.latest_path = ""
         self._last_seq_progress_time = 0.0
+        self.thread_status: Dict[int, Dict[str, Any]] = {
+            i: {"status": "idle", "path": "", "items": 0} for i in range(self.threads)
+        }
 
     def _is_excluded(self, path: str, name: str) -> bool:
         for pat in self.excludes:
@@ -179,6 +182,16 @@ class Scanner:
     def stop(self) -> None:
         """Signal all worker threads to cancel scanning."""
         self.stop_event.set()
+
+    def get_thread_status(self) -> Tuple[int, Optional[float], float, Dict[int, Dict[str, Any]]]:
+        """Return a snapshot of current scan stats and each thread's status."""
+        with self._lock:
+            return (
+                self.scanned_items,
+                self.calibrated_rate,
+                time.time() - self.start_time if self.start_time > 0 else 0.0,
+                {k: dict(v) for k, v in self.thread_status.items()},
+            )
 
     def scan(self) -> Optional[Node]:
         """Perform directory scan with cancellation support."""
@@ -228,7 +241,7 @@ class Scanner:
         if self.stop_event.is_set():
             return
 
-        self._record_path(dir_node.path)
+        self._record_path(dir_node.path, thread_id=0)
         now = time.time()
         if self.progress_callback and (now - self._last_seq_progress_time >= 2.0):
             self._last_seq_progress_time = now
@@ -245,7 +258,7 @@ class Scanner:
                     if self.stop_event.is_set():
                         return
 
-                    self._increment_item()
+                    self._increment_item(thread_id=0)
                     name = entry.name
                     path = entry.path
 
@@ -286,7 +299,7 @@ class Scanner:
         active_count = 0
         all_done = threading.Event()
 
-        def worker():
+        def worker(thread_id: int):
             nonlocal active_count
             while not all_done.is_set() and not self.stop_event.is_set():
                 try:
@@ -296,6 +309,8 @@ class Scanner:
                         if active_count == 0 and work_queue.empty():
                             all_done.set()
                             return
+                    with self._lock:
+                        self.thread_status[thread_id]["status"] = "idle"
                     continue
 
                 if self.stop_event.is_set():
@@ -305,14 +320,18 @@ class Scanner:
                 with active_lock:
                     active_count += 1
 
+                with self._lock:
+                    self.thread_status[thread_id]["status"] = "scanning"
+                    self.thread_status[thread_id]["path"] = dir_node.path
+
                 try:
-                    self._record_path(dir_node.path)
+                    self._record_path(dir_node.path, thread_id=thread_id)
                     with os.scandir(dir_node.path) as it:
                         for entry in it:
                             if self.stop_event.is_set():
                                 break
 
-                            self._increment_item()
+                            self._increment_item(thread_id=thread_id)
                             name = entry.name
                             path = entry.path
 
@@ -353,14 +372,16 @@ class Scanner:
                         if active_count == 0 and work_queue.empty():
                             all_done.set()
                     work_queue.task_done()
+                    with self._lock:
+                        self.thread_status[thread_id]["status"] = "idle"
 
         worker_threads = []
-        for _ in range(self.threads):
-            t = threading.Thread(target=worker, daemon=True)
+        for tid in range(self.threads):
+            t = threading.Thread(target=worker, args=(tid,), daemon=True)
             t.start()
             worker_threads.append(t)
 
-        # Main thread coordinates and prints progress every 2 seconds
+        # Main thread coordinates and prints progress every 2 seconds if callback exists
         try:
             while not all_done.wait(timeout=2.0):
                 if self.stop_event.is_set():
@@ -387,36 +408,155 @@ class Scanner:
         for t in worker_threads:
             t.join(timeout=0.5)
 
-    def _increment_item(self) -> None:
+    def _increment_item(self, thread_id: int = 0) -> None:
         with self._lock:
             self.scanned_items += 1
+            if thread_id in self.thread_status:
+                self.thread_status[thread_id]["items"] += 1
             # Calibration: calculate rate on the first 100 items
             if self.scanned_items == 100 and self.calibrated_rate is None:
                 elapsed = time.time() - self.start_time
                 self.calibrated_time_for_100 = elapsed
                 self.calibrated_rate = 100.0 / max(elapsed, 0.0001)
 
-    def _record_path(self, path: str) -> None:
+    def _record_path(self, path: str, thread_id: int = 0) -> None:
         with self._lock:
             self.latest_path = path
+            if thread_id in self.thread_status:
+                self.thread_status[thread_id]["path"] = path
+                self.thread_status[thread_id]["status"] = "scanning"
+
+
+def render_curses_scan(stdscr, scanner: Scanner) -> Optional[Node]:
+    """Render live multi-threaded scanning progress dashboard in curses."""
+    curses.curs_set(0)
+    stdscr.timeout(50)
+    curses.use_default_colors()
+
+    if curses.has_colors():
+        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)    # Header/Footer
+        curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE)    # Active
+        curses.init_pair(3, curses.COLOR_GREEN, -1)                  # Scanning status
+        curses.init_pair(4, curses.COLOR_YELLOW, -1)                 # Idle status
+
+    scan_done = threading.Event()
+    root_box: List[Optional[Node]] = [None]
+    error_box: List[Optional[Exception]] = [None]
+
+    def scan_worker():
+        try:
+            root_box[0] = scanner.scan()
+        except Exception as e:
+            error_box[0] = e
+        finally:
+            scan_done.set()
+
+    t = threading.Thread(target=scan_worker, daemon=True)
+    t.start()
+
+    while not scan_done.is_set():
+        try:
+            ch = stdscr.getch()
+        except curses.error:
+            ch = -1
+
+        if ch in (ord('q'), ord('Q'), 27):  # 'q' or ESC
+            scanner.stop()
+            break
+
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        if h < 5 or w < 30:
+            stdscr.addstr(0, 0, "Window too small")
+            stdscr.refresh()
+            continue
+
+        scanned_items, rate, elapsed, thread_status = scanner.get_thread_status()
+
+        # 1. Header Bar
+        hdr = f" ncdu.py {__version__} ~ Scanning: {scanner.root_path} (Threads: {scanner.threads})"
+        hdr = hdr[:w - 1].ljust(w - 1)
+        attr_hdr = curses.color_pair(1) if curses.has_colors() else curses.A_REVERSE
+        try:
+            stdscr.addstr(0, 0, hdr, attr_hdr)
+        except curses.error:
+            pass
+
+        # 2. Stats bar
+        rate_str = f"~{int(rate):,} items/s" if rate is not None else "calibrating (1st 100)..."
+        stats_line = f" Scanned: {scanned_items:,} items | Speed (1st 100): {rate_str} | Elapsed: {elapsed:.1f}s"
+        stats_line = stats_line[:w - 1].ljust(w - 1)
+        try:
+            stdscr.addstr(1, 0, stats_line)
+            stdscr.addstr(2, 0, "-" * (w - 1))
+        except curses.error:
+            pass
+
+        # 3. Thread Activity Lines
+        avail_rows = h - 5
+        visible_threads = min(len(thread_status), avail_rows)
+        for i in range(visible_threads):
+            info = thread_status.get(i, {"status": "idle", "path": "", "items": 0})
+            st = info.get("status", "idle").upper()
+            items_c = info.get("items", 0)
+            path_str = info.get("path", "")
+
+            prefix = f" Thread #{i:02d}: [{st:8s}] {items_c:>6,} items | "
+            rem_w = max(0, w - 1 - len(prefix))
+            if len(path_str) > rem_w:
+                path_display = "..." + path_str[-(rem_w - 3):] if rem_w > 3 else path_str[:rem_w]
+            else:
+                path_display = path_str
+
+            row_line = (prefix + path_display)[:w - 1].ljust(w - 1)
+            row_y = 3 + i
+
+            attr = curses.A_NORMAL
+            if st == "SCANNING" and curses.has_colors():
+                attr = curses.color_pair(3) | curses.A_BOLD
+            elif st == "IDLE" and curses.has_colors():
+                attr = curses.color_pair(4)
+
+            try:
+                stdscr.addstr(row_y, 0, row_line, attr)
+            except curses.error:
+                pass
+
+        # 4. Footer
+        footer_text = " Scanning in progress... Press 'q' or Ctrl+C to cancel"
+        footer_text = footer_text[:w - 1].ljust(w - 1)
+        try:
+            stdscr.addstr(h - 1, 0, footer_text, attr_hdr)
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+
+    t.join(timeout=1.0)
+    if error_box[0]:
+        raise error_box[0]
+
+    return root_box[0]
 
 
 class NcduApp:
     """TUI Application for browsing disk usage."""
 
-    def __init__(self, root_node: Node):
+    def __init__(self, root_node: Optional[Node] = None, scanner: Optional[Scanner] = None):
         self.root = root_node
+        self.scanner = scanner
         self.current_dir = root_node
         self.cursor_idx = 0
         self.scroll_offset = 0
         self.sort_key = "size"  # 'size', 'name', 'count'
         self.sort_reverse = True
         self.items: List[Node] = []
-        self._update_item_list()
+        if root_node is not None:
+            self._update_item_list()
 
     def _update_item_list(self) -> None:
         """Sort and refresh the list of children for the current directory."""
-        if not self.current_dir.is_dir:
+        if not self.current_dir or not self.current_dir.is_dir:
             self.items = []
             return
 
@@ -432,12 +572,25 @@ class NcduApp:
         if self.cursor_idx >= len(self.items):
             self.cursor_idx = max(0, len(self.items) - 1)
 
-    def run(self) -> None:
+    def run(self) -> Optional[Node]:
         """Initialize curses and run event loop."""
         if curses is None:
             print("Error: curses library is not available. Please install windows-curses on Windows.", file=sys.stderr)
             sys.exit(1)
-        curses.wrapper(self._main_loop)
+        return curses.wrapper(self._entry_loop)
+
+    def _entry_loop(self, stdscr) -> Optional[Node]:
+        # If scanner is provided, render curses live scan first
+        if self.root is None and self.scanner is not None:
+            self.root = render_curses_scan(stdscr, self.scanner)
+            if self.root is None or self.scanner.stop_event.is_set():
+                return None
+            self.current_dir = self.root
+            self._update_item_list()
+
+        if self.root is not None:
+            self._main_loop(stdscr)
+        return self.root
 
     def _main_loop(self, stdscr) -> None:
         curses.curs_set(0)
@@ -515,7 +668,7 @@ class NcduApp:
                 self._update_item_list()
 
     def _go_parent(self) -> None:
-        if self.current_dir.parent is not None:
+        if self.current_dir and self.current_dir.parent is not None:
             prev = self.current_dir
             self.current_dir = self.current_dir.parent
             self.scroll_offset = 0
@@ -531,7 +684,7 @@ class NcduApp:
     def _render(self, stdscr) -> None:
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        if h < 5 or w < 30:
+        if h < 5 or w < 30 or not self.current_dir:
             stdscr.addstr(0, 0, "Window too small")
             stdscr.refresh()
             return
@@ -690,7 +843,7 @@ class NcduApp:
         self._show_modal(stdscr, "Help & Keybindings", help_lines)
 
     def _show_info_modal(self, stdscr) -> None:
-        if not (0 <= self.cursor_idx < len(self.items)):
+        if not self.items or not (0 <= self.cursor_idx < len(self.items)):
             return
         item = self.items[self.cursor_idx]
         mtime_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(item.mtime)) if item.mtime else "Unknown"
@@ -706,7 +859,7 @@ class NcduApp:
         self._show_modal(stdscr, "Item Information", lines)
 
     def _handle_delete(self, stdscr) -> None:
-        if not (0 <= self.cursor_idx < len(self.items)):
+        if not self.items or not (0 <= self.cursor_idx < len(self.items)) or not self.current_dir:
             return
         item = self.items[self.cursor_idx]
 
@@ -750,6 +903,8 @@ class NcduApp:
 
     def _spawn_shell(self, stdscr) -> None:
         """Spawn a subshell in the current directory."""
+        if not self.current_dir:
+            return
         curses.def_prog_mode()
         curses.endwin()
         try:
@@ -819,6 +974,11 @@ def main() -> None:
         help="Import and browse directory tree from an exported JSON file",
     )
     parser.add_argument(
+        "--no-curses",
+        action="store_true",
+        help="Disable curses TUI during scan and run in terminal text mode",
+    )
+    parser.add_argument(
         "-v",
         "--version",
         action="version",
@@ -840,21 +1000,31 @@ def main() -> None:
         except Exception as e:
             print(f"Error loading export file: {e}", file=sys.stderr)
             sys.exit(1)
-    else:
-        # Perform scan
-        target_path = os.path.abspath(args.path)
-        if not os.path.exists(target_path):
-            print(f"Error: Path does not exist: {target_path}", file=sys.stderr)
-            sys.exit(1)
 
+        app = NcduApp(root_node=root_node)
+        try:
+            app.run()
+        except KeyboardInterrupt:
+            pass
+        return
+
+    # Perform scan
+    target_path = os.path.abspath(args.path)
+    if not os.path.exists(target_path):
+        print(f"Error: Path does not exist: {target_path}", file=sys.stderr)
+        sys.exit(1)
+
+    scanner = Scanner(
+        root_path=target_path,
+        same_fs=args.same_fs,
+        excludes=args.exclude,
+        threads=args.threads,
+        progress_callback=scan_progress_terminal if args.no_curses else None,
+    )
+
+    # If text-only mode or curses not available
+    if args.no_curses or curses is None:
         print(f"Scanning directory: {target_path} (threads: {args.threads}) ...")
-        scanner = Scanner(
-            root_path=target_path,
-            same_fs=args.same_fs,
-            excludes=args.exclude,
-            threads=args.threads,
-            progress_callback=scan_progress_terminal,
-        )
         t0 = time.time()
         try:
             root_node = scanner.scan()
@@ -874,7 +1044,6 @@ def main() -> None:
         rate_info = f", estimated speed: {int(scanner.calibrated_rate)} items/s (calibrated on first 100 files)" if scanner.calibrated_rate else ""
         print(f"Scan complete: {scanner.scanned_items} items in {scan_time:.2f}s ({format_size(root_node.size).strip()}{rate_info})")
 
-        # If export requested
         if args.export:
             try:
                 with open(args.export, "w", encoding="utf-8") as f:
@@ -885,12 +1054,28 @@ def main() -> None:
                 sys.exit(1)
             return
 
-    # Start TUI
-    app = NcduApp(root_node)
+        app = NcduApp(root_node=root_node)
+        try:
+            app.run()
+        except KeyboardInterrupt:
+            pass
+        return
+
+    # Default Curses Live Scan + Browser Mode
+    app = NcduApp(scanner=scanner)
     try:
-        app.run()
+        root_node = app.run()
     except KeyboardInterrupt:
-        pass
+        root_node = None
+
+    # Handle export if requested
+    if args.export and root_node is not None:
+        try:
+            with open(args.export, "w", encoding="utf-8") as f:
+                json.dump(root_node.to_dict(), f, indent=2)
+            print(f"Exported scan results to: {args.export}")
+        except Exception as e:
+            print(f"Error exporting results: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
